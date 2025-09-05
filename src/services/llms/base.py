@@ -1,10 +1,3 @@
-
----
-
-# ✅ `src/services/llms/base.py` (완성본 – 파서 안정/헬퍼 포함)
-> `gemini.py`가 이 헬퍼들에 의존합니다. 아래 그대로 교체하세요.
-
-```python
 # src/services/llms/base.py
 from __future__ import annotations
 
