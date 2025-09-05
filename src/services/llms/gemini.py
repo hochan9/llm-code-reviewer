@@ -1,164 +1,93 @@
-from typing import List, Dict, Optional
-import re
-import time
-import random
-import threading
-from functools import lru_cache
+# src/services/llms/gemini.py
+from __future__ import annotations
 
-import google.generativeai as Client
-from google.api_core import exceptions as gexc
-from unidiff import Hunk, PatchedFile
+from typing import List, Dict
+import google.generativeai as genai
+from unidiff.patch import Hunk, PatchedFile
 
 from ...core.config import Config
 from ...core.models import PRDetails
 from .base import BaseLLMService
 
 
-# ----- 분당 호출 제한기 (폭주 방지) -----
-class MinuteRateLimiter:
-    def __init__(self, rpm: int):
-        self.rpm = max(1, rpm)
-        self.lock = threading.Lock()
-        self.count = 0
-        self.window_start = time.time()
-
-    def acquire(self):
-        with self.lock:
-            now = time.time()
-            # 새 60초 윈도우로 교체
-            if now - self.window_start >= 60:
-                self.window_start = now
-                self.count = 0
-            # 꽉 찼으면 다음 윈도우까지 대기
-            if self.count >= self.rpm:
-                sleep_for = 60 - (now - self.window_start) + 0.05
-                if sleep_for > 0:
-                    time.sleep(sleep_for)
-                self.window_start = time.time()
-                self.count = 0
-            self.count += 1
-
-
-def _extract_retry_seconds(err: Exception) -> Optional[int]:
-    """
-    Gemini SDK 에러 문자열에서 `retry_delay { seconds: N }` 값을 파싱.
-    없으면 None.
-    """
-    m = re.search(r"retry_delay\s*{\s*seconds:\s*(\d+)", str(err))
-    return int(m.group(1)) if m else None
-
-
 class GeminiService(BaseLLMService):
-    """
-    Google의 Gemini 모델용 BaseLLMService 구현 (429/일시적 오류 대비 강화판)
-    """
+    """Google Gemini API 구현."""
 
-    def __init__(self):
-        """구성값으로 Gemini 서비스를 초기화합니다."""
-        Client.configure(api_key=Config.GEMINI_API_KEY)
-        self.model = Client.GenerativeModel(Config.GEMINI_MODEL)
+    def __init__(self) -> None:
+        api_key = getattr(Config, "GEMINI_API_KEY", None)
+        if not api_key:
+            raise RuntimeError("GEMINI_API_KEY 가 설정되어 있지 않습니다.")
+        genai.configure(api_key=api_key)
 
-        # 환경에서 조절 가능. 값이 없으면 보수적으로 10 RPM 사용.
-        rpm = getattr(Config, "GEMINI_RPM", 10)
-        self.ratelimiter = MinuteRateLimiter(rpm)
-
-        # 생성 파라미터도 Config에서 주입 가능 (없으면 기본값 사용)
-        self._max_output_tokens = getattr(Config, "GEMINI_MAX_OUTPUT_TOKENS", 768)
-        self._temperature = getattr(Config, "GEMINI_TEMPERATURE", 0.3)
+        # 1.5 Flash는 단계적 종료 예정 → 기본 모델을 2.0 Flash로 권장
+        model_name = getattr(Config, "GEMINI_MODEL", None) or "gemini-2.0-flash"
+        self.model = genai.GenerativeModel(model_name)
 
     def create_prompt(self, file: PatchedFile, hunk: Hunk, pr_details: PRDetails) -> str:
-        """Gemini의 기대 형식에 맞춘 프롬프트를 생성합니다."""
+        """
+        코드 리뷰 지시 프롬프트. 반드시 JSON만 반환하도록 요구.
+        표준 스키마:
+        {
+          "reviews": [
+            { "lineNumber": <int>, "side": "LEFT|RIGHT", "reviewComment": "...", "severity": "nit|warn|crit" }
+          ]
+        }
+        """
+        file_path = getattr(file, "path", "") or getattr(file, "source_file", "") or ""
         return f"""
-            Your task is to review the following code changes. Please follow these guidelines:
-            Provide your response in this JSON format:
-            {{"reviews": [{{"lineNumber": <line_number>, "reviewComment": "<review comment>", "side": "<left or right>", "filepath": "<file path>"}}]}}
-            Important Rules:
-            1. Line Number Validation:
-            - For "left" side: {hunk.source_start} ≤ lineNumber < {hunk.source_start + hunk.source_length}
-            - For "right" side: {hunk.target_start} ≤ lineNumber < {hunk.target_start + hunk.target_length}
+당신은 숙련된 코드 리뷰어입니다. 다음 변경에서 버그/보안/성능/가독성 문제와 개선점을 찾아주세요.
+PR 제목: {pr_details.title}
+PR 설명: {pr_details.description}
+파일 경로: {file_path}
 
-            2. Review Focus Areas:
-            - Critical bugs and errors
-            - Security vulnerabilities and risks
-            - Performance optimization opportunities
-            - Code architecture and maintainability issues
-            - Suggest code for improvement and optimization
+반드시 아래 **JSON만** 출력하세요(코드펜스/설명 금지):
+{{
+  "reviews": [
+    {{ "lineNumber": 0, "side": "RIGHT", "reviewComment": "설명", "severity": "nit|warn|crit" }}
+  ]
+}}
 
-            3. Key Requirements:
-            - Return empty "reviews" array if no issues found
-            - Use GitHub Markdown formatting in your comments
-            - Do NOT suggest adding code comments
-            - Provide feedback in language: {Config.HUMAN_LANGUAGE}
+변경(diff):
+```diff
+{str(hunk)}
+    """.strip()
 
-            Context Information:
-            File: {file.path}
-            PR Title: {pr_details.title}
-            PR Description:
-            ---
-            {pr_details.description or 'No description provided'}
-            ---
+def _extract_text(self, resp) -> str:
+    """
+    SDK 버전별 응답 포맷 차이에 대응하여 텍스트를 안전하게 추출.
+    우선 resp.text, 없으면 candidates[].content.parts[].text를 조합.
+    """
+    text = getattr(resp, "text", None)
+    if isinstance(text, str) and text.strip():
+        return text
 
-            Git Diff Details:
-            - Source Start: {hunk.source_start}
-            - Source Length: {hunk.source_length}
-            - Target Start: {hunk.target_start}
-            - Target Length: {hunk.target_length}
+    try:
+        candidates = getattr(resp, "candidates", None) or []
+        for cand in candidates:
+            content = getattr(cand, "content", None)
+            parts = getattr(content, "parts", None) or []
+            collected: List[str] = []
+            for p in parts:
+                t = getattr(p, "text", None)
+                if isinstance(t, str) and t:
+                    collected.append(t)
+            if collected:
+                return "\n".join(collected)
+    except Exception:
+        pass
+    return ""
 
-            Code Diff to Review:
-            ```diff
-            {hunk.__str__()}
-            ```
-        """
-
-    # 동일 프롬프트 중복 호출을 제거 (최대 256개 캐시)
-    @lru_cache(maxsize=256)
-    def _cached_generate(self, prompt: str) -> str:
-        """
-        실제 Gemini 호출부.
-        - 분당 호출 제한 (QPS 스로틀)
-        - 429/일시적 오류에 대해 retry_delay 준수 + 지수 백오프(+지터)
-        """
-        self.ratelimiter.acquire()
-
-        max_attempts = 6
-        backoff = 2.0  # seconds
-
-        for attempt in range(1, max_attempts + 1):
-            try:
-                resp = self.model.generate_content(
-                    prompt,
-                    generation_config={
-                        "max_output_tokens": self._max_output_tokens,
-                        "temperature": self._temperature,
-                    },
-                )
-                return resp.text or ""
-            except (gexc.ResourceExhausted, gexc.TooManyRequests) as e:
-                # 429: SDK가 제공한 retry_delay 우선
-                delay = _extract_retry_seconds(e)
-                if delay is None:
-                    # 지수 백오프 + 지터
-                    delay = min(backoff, 60.0) + random.uniform(0, 0.25 * backoff)
-                    backoff = min(backoff * 2, 60.0)
-                time.sleep(delay)
-                continue
-            except (gexc.ServiceUnavailable, gexc.DeadlineExceeded) as e:
-                # 일시적 장애/타임아웃: 지수 백오프
-                delay = min(backoff, 30.0) + random.uniform(0, 0.25 * backoff)
-                backoff = min(backoff * 2, 60.0)
-                time.sleep(delay)
-                continue
-            except Exception:
-                # 그 외는 즉시 전파
-                raise
-        raise RuntimeError("Gemini generate_content: 재시도 한도를 초과했습니다.")
-
-    def get_ai_response(self, prompt: str) -> List[Dict[str, str]]:
-        """Gemini 모델에서 응답을 가져옵니다. (429/일시적 오류 대비)"""
-        try:
-            response_text = self._cached_generate(prompt)
-            response_text = self._clean_response_text(response_text)
-            return self._parse_response(response_text)
-        except Exception as e:
-            print(f"Gemini API 호출 실패: {e}")
-            return []
+def get_ai_response(self, prompt: str) -> List[Dict[str, str]]:
+    """Gemini 호출 → 텍스트 추출 → 정제(JSON 파싱) → 표준 스키마로 반환."""
+    try:
+        resp = self.model.generate_content(
+            prompt,
+            generation_config={"max_output_tokens": 1024, "temperature": 0.3},
+        )
+        raw = self._extract_text(resp)
+        cleaned = self._clean_response_text(raw)
+        return self._parse_response(cleaned)
+    except Exception as e:
+        # 필요 시 로거로 교체 가능
+        print(f"[GeminiService] Error during API call: {e}")
+        return []

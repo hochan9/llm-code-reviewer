@@ -51,3 +51,4 @@ unidiff==0.7.5
 uritemplate==4.1.1
 urllib3==2.2.3
 wrapt==1.16.0
+PyGithub==2.5.0
