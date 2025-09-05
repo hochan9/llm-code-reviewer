@@ -19,7 +19,7 @@ class GeminiService(BaseLLMService):
             raise RuntimeError("GEMINI_API_KEY 가 설정되어 있지 않습니다.")
         genai.configure(api_key=api_key)
 
-        # 1.5 Flash는 단계적 종료 예정 → 기본 모델을 2.0 Flash로 권장
+        # 1.5 Flash는 단계적 종료 → 기본 모델은 2.0 Flash 권장
         model_name = getattr(Config, "GEMINI_MODEL", None) or "gemini-2.0-flash"
         self.model = genai.GenerativeModel(model_name)
 
